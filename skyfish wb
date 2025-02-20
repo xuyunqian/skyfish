@@ -1,0 +1,496 @@
+  import os
+import numpy as np
+import rasterio
+import rasterio.features
+from rasterio.enums import Resampling
+import PySimpleGUI as sg
+from scipy.ndimage import distance_transform_edt
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import geopandas as gpd
+from shapely.geometry import shape
+import fiona
+import pandas as pd
+from whitebox import WhiteboxTools
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 显示中文
+
+# ------------------------------
+# 核心计算模块（优化版）
+# ------------------------------
+class FloodModel:
+    def __init__(self):
+        self.dem = None
+        self.profile = None
+        self.streams = None
+        self.hand = None
+        self.inundation = None
+        self.water_depth = None
+
+    def load_dem(self, dem_path):
+        """加载DEM数据并自动检测无效值"""
+        try:
+            with rasterio.open(dem_path) as src:
+                self.dem = src.read(1)
+                self.profile = src.profile
+                self.dem = np.where(self.dem == src.nodata, np.nan, self.dem)
+                return True, "DEM加载成功"
+        except Exception as e:
+            return False, f"DEM加载失败: {str(e)}"
+
+    def extract_streams(self, method='percentile', threshold=30, accum_path=None, dem_path=None):
+        """支持多种河道提取方法"""
+        if method == 'percentile':
+            self.streams = np.where(self.dem < np.nanpercentile(self.dem, threshold), 1, 0)
+        elif method == 'accumulation' and accum_path:
+            with rasterio.open(accum_path) as src:
+                accum = src.read(1)
+            self.streams = np.where(accum > threshold, 1, 0)
+        elif method == 'whitebox' and dem_path:
+            self._extract_streams_whitebox(dem_path, threshold)
+        elif method == 'optimized' and dem_path:
+            self._extract_streams_optimized(dem_path, threshold)
+        return self.streams
+
+    def _extract_streams_whitebox(self, dem_path, threshold):
+        """使用Whitebox工具提取河道"""
+        wbt = WhiteboxTools()
+        wbt.verbose = False
+        temp_dir = os.path.dirname(dem_path)
+        flow_accum_path = os.path.join(temp_dir, "flow_accum.tif")
+        streams_path = os.path.join(temp_dir, "streams.tif")
+
+        # 计算流量累积
+        wbt.d8_pointer(dem_path, os.path.join(temp_dir, "d8_pntr.tif"))
+        wbt.d8_flow_accumulation(dem_path, flow_accum_path, out_type='specific contributing area')
+
+        # 提取河道
+        wbt.extract_streams(flow_accum_path, streams_path, threshold)
+
+        # 读取生成的流量累积文件
+        with rasterio.open(streams_path) as src:  
+            self.streams = src.read(1)
+            self.streams = np.where(self.streams > 0, 1, 0)
+
+    def _extract_streams_optimized(self, dem_path, threshold):
+        """针对平原地区优化的河道提取方法"""
+        wbt = WhiteboxTools()
+        wbt.verbose = False
+        temp_dir = os.path.dirname(dem_path)
+        slope_path = os.path.join(temp_dir, "slope.tif")
+        curvature_path = os.path.join(temp_dir, "curvature.tif")
+        flow_accum_path = os.path.join(temp_dir, "flow_accum.tif")
+        streams_path = os.path.join(temp_dir, "streams.tif")
+
+        # 计算坡度和曲率
+        wbt.slope(dem_path, slope_path)
+        wbt.plan_curvature(dem_path, curvature_path)
+
+        # 计算流量累积
+        wbt.d8_pointer(dem_path, os.path.join(temp_dir, "d8_pntr.tif"))
+        wbt.d8_flow_accumulation(dem_path, flow_accum_path, out_type='specific contributing area')
+
+        # 提取河道
+        wbt.extract_streams(flow_accum_path, streams_path, threshold)
+
+        # 读取生成的流量累积文件
+        with rasterio.open(streams_path) as src:
+            streams_data = src.read(1)
+
+        # 读取坡度和曲率文件
+        with rasterio.open(slope_path) as src:
+            slope_data = src.read(1)
+        with rasterio.open(curvature_path) as src:
+            curvature_data = src.read(1)
+
+        # 综合判断河道区域
+        slope_threshold = 0.1   #0.01
+        curvature_threshold = 0.001
+        accumulation_threshold = threshold
+        # 应用优化的条件判断
+        self.streams = np.where(
+            (streams_data > accumulation_threshold) & (slope_data > slope_threshold) & (
+                        curvature_data < curvature_threshold),
+            1,
+            0
+        )
+
+    def calculate_hand(self):
+        """优化HAND计算性能"""
+        stream_indices = np.argwhere(self.streams == 1)
+        if len(stream_indices) == 0:
+            raise ValueError("未检测到河道，请调整提取参数")
+
+        distances, indices = distance_transform_edt(~self.streams.astype(bool), return_indices=True)
+        nearest_drainage = self.dem[tuple(indices)]
+        self.hand = self.dem - nearest_drainage
+        return self.hand
+
+    def simulate_inundation(self, water_level):
+        """支持多水位模拟"""
+        self.inundation = np.where(self.hand <= water_level, 1, 0)
+        self.water_depth = np.where(
+            self.inundation == 1,
+            water_level - self.hand,
+            0.0
+        )
+        return self.inundation, self.water_depth
+
+    def export_results(self, output_path, format='geotiff'):
+        """支持多种格式导出"""
+        if format == 'geotiff':
+            self._export_geotiff(output_path)
+        elif format == 'shapefile':
+            self._export_shapefile(output_path)
+        elif format == 'geojson':
+            self._export_geojson(output_path)
+        elif format == 'csv':
+            self._export_csv(output_path)
+        else:
+            raise ValueError(f"不支持的格式: {format}")
+
+    def _export_geotiff(self, output_path):
+        """导出包含淹没区和水深双波段的GeoTIFF"""
+        profile = self.profile.copy()
+        profile.update(
+            dtype=rasterio.float32,
+            nodata=np.nan,
+            count=2,
+            compress='lzw'
+        )
+
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            dst.write(self.inundation.astype(rasterio.float32), 1)
+            dst.write(np.where(self.inundation == 1, self.water_depth, np.nan).astype(rasterio.float32), 2)
+            dst.set_band_description(1, "Inundation Area (1=flooded)")
+            dst.set_band_description(2, "Water Depth (meters)")
+
+    def _export_shapefile(self, output_path):
+        """导出Shapefile多边形"""
+        gdf = self._vectorize_inundation()
+        gdf.to_file(output_path, driver='ESRI Shapefile', encoding='utf-8')
+
+    def _export_geojson(self, output_path):
+        """导出带完整水深属性的GeoJSON"""
+        gdf = self._vectorize_inundation()
+        if gdf.empty:
+            raise ValueError("无淹没区域可导出")
+
+        # 数据精度处理
+        gdf['max_depth'] = gdf['max_depth'].round(2).astype(float)
+        gdf['min_depth'] = gdf['min_depth'].round(2).astype(float)
+        gdf['avg_depth'] = gdf['avg_depth'].round(2).astype(float)
+        gdf['area_m2'] = gdf['area_m2'].round().astype(int)
+
+        # 移除schema参数，使用默认几何类型推断
+        gdf.to_file(
+            output_path,
+            driver='GeoJSON',
+            encoding='utf-8',
+            crs=self.profile['crs']
+        )
+
+    def _export_csv(self, output_path):
+        """导出CSV（修复版）"""
+        valid_points = np.where(self.inundation == 1)
+        if len(valid_points[0]) == 0:
+            raise ValueError("无淹没区域可导出")
+        data = {
+            'x': [],
+            'y': [],
+            'elevation': [],
+            'hand': [],
+            'water_depth': []
+        }
+        transform = self.profile['transform']
+        x_coords, y_coords = rasterio.transform.xy(transform, valid_points[0], valid_points[1])
+        data['x'] = np.round(x_coords, 2)
+        data['y'] = np.round(y_coords, 2)
+        data['elevation'] = np.round(self.dem[valid_points], 2)
+        data['hand'] = np.round(self.hand[valid_points], 2)
+        data['water_depth'] = np.round(self.water_depth[valid_points], 2)
+        df = pd.DataFrame(data)
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+
+    def _vectorize_inundation(self):
+        """矢量化淹没区并添加水深属性"""
+        mask = self.inundation == 1
+        shapes = rasterio.features.shapes(
+            mask.astype(np.uint8),
+            transform=self.profile['transform']
+        )
+        polygons = []
+        for geom, val in shapes:
+            if val == 1:
+                geom_shape = shape(geom)
+                # 过滤无效几何体
+                if not geom_shape.is_valid:
+                    continue
+                # 处理MultiPolygon为多个Polygon
+                if geom_shape.geom_type == 'MultiPolygon':
+                    for poly in geom_shape.geoms:
+                        if poly.geom_type != 'Polygon':
+                            continue
+                        self._add_polygon(polygons, poly)
+                elif geom_shape.geom_type == 'Polygon':
+                    self._add_polygon(polygons, geom_shape)
+        gdf = gpd.GeoDataFrame(polygons, crs=self.profile['crs'])
+        return gdf
+    def _add_polygon(self, polygons, polygon):
+        """添加单个多边形并计算属性"""
+        geom_mask = rasterio.features.geometry_mask(
+            [polygon],
+            out_shape=self.dem.shape,
+            transform=self.profile['transform'],
+            invert=True
+        )
+        depth_values = self.water_depth[geom_mask]
+        valid_depths = depth_values[~np.isnan(depth_values)]
+        stats = {
+            'max_depth': np.max(valid_depths) if valid_depths.size > 0 else 0.0,
+            'min_depth': np.min(valid_depths) if valid_depths.size > 0 else 0.0,
+            'avg_depth': np.mean(valid_depths) if valid_depths.size > 0 else 0.0,
+            'area_m2': polygon.area * (self.profile['transform'].a ** 2)
+        }
+        polygons.append({
+            'geometry': polygon,
+            **stats
+        })
+# ------------------------------
+# GUI界面模块
+# ------------------------------
+class FloodGUI:
+    def __init__(self):
+        self.model = FloodModel()
+        self.layout = self._create_layout()
+        self.window = sg.Window("广东水科院水文淹没模拟系统FISH v1.0", self.layout, finalize=True)
+        self._init_plot()
+        self.cbar = None
+
+    def _create_layout(self):
+        """创建界面布局"""
+        control_col = [
+            [sg.Text("DEM文件:"), sg.Input(key='-DEM-'), sg.FileBrowse(file_types=(("GeoTIFF", "*.tif"),))],
+            [sg.Text("河道提取方法:"),
+             sg.Combo(['percentile', 'accumulation', 'whitebox', 'optimized'], key='-METHOD-', default_value='percentile')],
+            [sg.Text("阈值:"), sg.Input('30', key='-THRESH-', size=10)],
+            [sg.Text("洪水水位(m):"), sg.Slider((0, 100), 2.0, 0.1, orientation='h', key='-LEVEL-')],
+            [sg.Text("导出格式:"), sg.Combo(['geotiff', 'shapefile', 'geojson', 'csv'], default_value='geotiff', key='-EXPORT_FORMAT-')],
+            [sg.Button("运行模拟", key='-RUN-'), sg.Button("导出结果", key='-EXPORT-')],
+            [sg.ProgressBar(100, orientation='h', size=(20, 20), key='-PROG-')]
+        ]
+        plot_col = [
+            [sg.Canvas(key='-CANVAS-')],
+            [sg.Radio("DEM", "DISPLAY", key='-DEM_DISP-', default=True),
+             sg.Radio("河道", "DISPLAY", key='-STREAM_DISP-'),
+             sg.Radio("HAND", "DISPLAY", key='-HAND_DISP-'),
+             sg.Radio("淹没区", "DISPLAY", key='-INUN_DISP-'),
+             sg.Radio("水深", "DISPLAY", key='-DEPTH_DISP-'),
+             sg.Button("刷新显示", key='-REFRESH-')]
+        ]
+        return [
+            [sg.Column(control_col), sg.VSeparator(), sg.Column(plot_col)]
+        ]
+
+    def _init_plot(self):
+        """初始化绘图区域（修改版）"""
+        self.fig, self.ax = plt.subplots(figsize=(7, 5))
+        self.ax.set_title("淹没模拟结果")
+        self.cbar = None
+
+        # 初始化状态文本
+        self.status_text = self.ax.text(
+            0.95, 0.02, "",
+            transform=self.ax.transAxes,
+            ha='right', va='bottom',
+            bbox=dict(facecolor='white', alpha=0.8)
+        )
+
+        # 绑定鼠标移动事件
+        self.fig.canvas.mpl_connect('motion_notify_event', self._on_hover)
+
+        self.fig_agg = FigureCanvasTkAgg(self.fig, self.window['-CANVAS-'].TKCanvas)
+        self.fig_agg.draw()
+        self.fig_agg.get_tk_widget().pack(side='top', fill='both', expand=1)
+    def _update_plot(self, data, title):
+        """更新绘图（修改版）"""
+        self.ax.clear()
+        self.current_data = data  # 记录当前数据
+        self.current_title = title
+
+        if data is None:
+            self.ax.text(0.5, 0.5, "无可用数据", ha='center', va='center')
+            self.fig_agg.draw()
+            return
+
+        plot_data = np.nan_to_num(data, nan=0.0)
+        cmap_dict = {
+            "DEM高程": "terrain",
+            "河道网络": "binary",
+            "HAND值": "viridis",
+            "淹没区域": "Blues",
+            "水深分布": "jet"    #"水深分布": "jet"   viridis   winter  ocean   GnBu  Blues
+        }
+        im = self.ax.imshow(plot_data, cmap=cmap_dict.get(title, 'viridis'))
+
+        # 重新初始化状态文本
+        self.status_text = self.ax.text(
+            0.95, 0.02, "",
+            transform=self.ax.transAxes,
+            ha='right', va='bottom',
+            bbox=dict(facecolor='white', alpha=0.8)
+        )
+        if hasattr(self, 'cbar'):
+            try:
+                self.cbar.ax.remove()
+            except AttributeError:
+                pass
+            self.cbar = None
+        self.cbar = self.fig.colorbar(
+            im,
+            ax=self.ax,
+            cax=self.fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        )
+        self.ax.set_title(title)
+        self.ax.set_axis_off()
+        self.fig.tight_layout(rect=[0, 0, 0.9, 1])
+        self.fig_agg.draw()
+
+    def _on_hover(self, event):
+        """鼠标悬停事件处理"""
+        if self.current_data is None or not event.inaxes:
+            self.status_text.set_text("")
+            self.fig.canvas.draw_idle()
+            return
+
+        try:
+            # 转换坐标到数据索引
+            x = int(event.xdata + 0.5)
+            y = int(event.ydata + 0.5)
+
+            # 确保坐标在有效范围内
+            if 0 <= x < self.current_data.shape[1] and 0 <= y < self.current_data.shape[0]:
+                value = self.current_data[y, x]
+
+                # 获取地理坐标
+                transform = self.model.profile['transform']
+                geo_x, geo_y = transform * (x, y)
+
+                # 根据数据类型生成提示信息
+                if self.current_title == "DEM高程":
+                    info = f"高程值: {value:.2f} m\n坐标: ({geo_x:.2f}, {geo_y:.2f})"
+                elif self.current_title == "河道网络":
+                    info = f"河道: {'是' if value > 0 else '否'}\n坐标: ({geo_x:.2f}, {geo_y:.2f})"
+                elif self.current_title == "HAND值":
+                    info = f"HAND: {value:.2f} m\n坐标: ({geo_x:.2f}, {geo_y:.2f})"
+                elif self.current_title == "淹没区域":
+                    info = f"淹没: {'是' if value > 0 else '否'}\n坐标: ({geo_x:.2f}, {geo_y:.2f})"
+                elif self.current_title == "水深分布":
+                    info = f"水深: {value:.2f} m\n坐标: ({geo_x:.2f}, {geo_y:.2f})"  
+                else:
+                    info = f"值: {value:.2f}\n坐标: ({geo_x:.2f}, {geo_y:.2f})"
+
+                self.status_text.set_text(info)
+            else:
+                self.status_text.set_text("")
+
+        except Exception as e:
+            self.status_text.set_text(f"错误: {str(e)}")
+
+        self.fig.canvas.draw_idle()
+
+
+
+    def run(self):
+        """主事件循环"""
+        while True:
+            event, values = self.window.read()
+            if event == sg.WIN_CLOSED:
+                break
+            if event == '-RUN-':
+                try:
+                    self.window['-PROG-'].update(10)
+                    status, msg = self.model.load_dem(values['-DEM-'])
+                    if not status:
+                        sg.popup_error(msg)
+                        continue
+                    self.window['-PROG-'].update(30)
+                    dem_path = values['-DEM-']
+                    self.model.extract_streams(
+                        method=values['-METHOD-'],
+                        threshold=float(values['-THRESH-']),
+                        dem_path=dem_path
+                    )
+                    self.window['-PROG-'].update(50)
+                    self.model.calculate_hand()
+                    self.window['-PROG-'].update(70)
+                    self.model.simulate_inundation(values['-LEVEL-'])
+                    self.window['-PROG-'].update(100)
+                    sg.popup("模拟完成！")
+                    if values['-DEM_DISP-']:
+                        self._update_plot(self.model.dem, "DEM高程")
+                    elif values['-STREAM_DISP-']:
+                        self._update_plot(self.model.streams, "河道网络")
+                    elif values['-HAND_DISP-']:
+                        self._update_plot(self.model.hand, "HAND值")
+                    elif values['-INUN_DISP-']:
+                        self._update_plot(self.model.inundation, "淹没区域")
+                    elif values['-DEPTH_DISP-']:
+                        self._update_plot(self.model.water_depth, "水深分布")
+                except Exception as e:
+                    sg.popup_error(f"运行错误: {str(e)}")
+            if event == '-REFRESH-':
+                if self.model.dem is None:
+                    sg.popup_error("请先加载DEM数据")
+                    continue
+                try:
+                    if values['-DEM_DISP-']:
+                        self._update_plot(self.model.dem, "DEM高程")
+                    elif values['-STREAM_DISP-']:
+                        self._update_plot(self.model.streams, "河道网络")
+                    elif values['-HAND_DISP-']:
+                        self._update_plot(self.model.hand, "HAND值")
+                    elif values['-INUN_DISP-']:
+                        self._update_plot(self.model.inundation, "淹没区域")
+                    elif values['-DEPTH_DISP-']:
+                        self._update_plot(self.model.water_depth, "水深分布")
+                except Exception as e:
+                    sg.popup_error(f"刷新失败: {str(e)}")
+            if event == '-EXPORT-':
+                if self.model.inundation is None:
+                    sg.popup_error("请先运行模拟")
+                    continue
+                export_format = values['-EXPORT_FORMAT-']
+                file_types = {
+                    'geotiff': [("GeoTIFF", "*.tif")],
+                    'shapefile': [("Shapefile", "*.shp")],
+                    'geojson': [("GeoJSON", "*.geojson")],
+                    'csv': [("CSV", "*.csv")]
+                }[export_format]
+                default_ext = {
+                    'geotiff': '.tif',
+                    'shapefile': '.shp',
+                    'geojson': '.geojson',
+                    'csv': '.csv'
+                }[export_format]
+                save_path = sg.popup_get_file(
+                    "保存结果",
+                    save_as=True,
+                    default_extension=default_ext,
+                    file_types=file_types
+                )
+                if save_path:
+                    try:
+                        self.model.export_results(save_path, format=export_format)
+                        sg.popup(f"结果已保存至: {save_path}")
+                    except Exception as e:
+                        sg.popup_error(f"导出失败: {str(e)}")
+
+if __name__ == "__main__":
+    gui = FloodGUI()
+    gui.run()
+
+### V2.0   细化河道提取功能；2025年2月19日17:08:45 xuyunqian
+
+# 导出geojson失败: Record's geometry type does not match collectionschemas geometry type: Polygon' != None
+
+### 增加了鼠标点击后显示数值的功能；2025年2月19日22:08:24  xuyunqian
